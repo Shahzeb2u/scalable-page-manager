@@ -1,0 +1,19 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.sublime-*
+
+# WordPress / local dev
+wp-config.php
+*.log
+
+# Dependencies (none required, but just in case)
+node_modules/
+vendor/
+
+# Build artifacts / archives
+*.zip
