@@ -1,0 +1,17 @@
+# Changelog
+
+All notable changes to this project are documented here. This project adheres to semantic versioning.
+
+## [1.5.0] - 2026-08-06
+### Added
+- Lazy, one-at-a-time FULLTEXT index building to avoid gateway timeouts on large tables.
+- Optional content + ACF FULLTEXT search behind a UI toggle.
+- Elementor-aware quick actions.
+- Duplicate detection and export endpoints.
+
+### Changed
+- Keyset (cursor) pagination replaces offset-based paging for constant per-request cost.
+
+## [1.0.0]
+### Added
+- Initial release: lazy hierarchy tree, virtual-scroll list, tiered indexed search, custom `spm/v1` REST namespace.
