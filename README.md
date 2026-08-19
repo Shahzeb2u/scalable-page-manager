@@ -1,60 +1,80 @@
-# Scalable Page Manager
+=== Scalable Page Manager ===
+Contributors: shahzeb2u
+Tags: pages, admin, performance, search, page management
+Requires at least: 6.0
+Tested up to: 7.0
+Requires PHP: 7.4
+Stable tag: 1.5.0
+License: GPLv2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-High-performance page management for WordPress sites with 10,000+ pages. Replaces the default admin pages list with a lazy-loaded hierarchy tree, a virtual-scroll list, keyset (cursor) pagination, and indexed FULLTEXT search across title, slug, content, and ACF fields. Elementor-aware quick actions included.
+High-performance page management for sites with 10,000+ pages: lazy tree, virtual-scroll list, keyset pagination, and indexed FULLTEXT search.
 
-Single-file plugin. No build step: the admin UI is vanilla JS, served inline and powered by a custom REST namespace (`spm/v1`).
+== Description ==
 
-## Why
+Scalable Page Manager replaces the default WordPress Pages screen with an admin interface built to stay fast on sites that have tens of thousands — or millions — of pages. The stock list table slows to a crawl at that scale because it relies on OFFSET pagination and unindexed queries. This plugin takes a different approach at every layer.
 
-The stock WordPress pages screen falls over on large sites. It uses `OFFSET` pagination (cost grows with dataset size), loads full post content into PHP, and its search is a leading-wildcard `LIKE` that can't use an index. On a site with tens of thousands of pages this means slow loads, timeouts, and unusable search. Scalable Page Manager is built so per-request cost stays roughly constant from 10k to 1M+ rows.
+**How it stays fast**
 
-## Features
+* **Keyset (cursor) pagination** instead of OFFSET, so the cost of loading any page of results is constant whether you have 10,000 rows or 1,000,000.
+* **Lazy hierarchy** — only the children of a node you actually expand are ever queried. The tree never loads the whole site at once.
+* **Tiered search** — numeric input goes straight to the primary key, slugs use an indexed equality/prefix lookup, and title/content/ACF search uses InnoDB FULLTEXT (`MATCH ... AGAINST`) rather than a leading-wildcard `LIKE`. Content and custom-field search is optional via a UI toggle and runs entirely in MySQL, so post content is never loaded into PHP memory.
+* **Virtual scrolling** keeps the DOM bounded (about 50 rows) at any dataset size.
+* **Cached aggregates** — totals, the parents list and duplicate reports are cached with the Transients API.
 
-- **Keyset (cursor) pagination** — never `OFFSET`, so per-request cost is constant regardless of dataset size.
-- **Lazy hierarchy tree** — only the children of an expanded node are queried.
-- **Tiered, indexed search** — numeric input resolves against the primary key; slug against an indexed equality/prefix match; title/content/ACF via InnoDB FULLTEXT (`MATCH ... AGAINST`), never a leading-wildcard `LIKE`. Content and ACF search is optional via a UI toggle and runs entirely in MySQL — post content is never pulled into PHP memory.
-- **Virtual scrolling** — the DOM stays bounded (~50 rows) at any dataset size.
-- **Chunked bulk actions** — bulk operations are batched client-side to avoid timeouts.
-- **Elementor-aware quick actions** — edit-with-Elementor and related shortcuts surfaced inline.
-- **Duplicate detection** — find pages sharing a title/slug.
-- **Export** — export the current filtered view.
-- **Safe activation on huge tables** — activation never runs `ALTER TABLE` inline (which can trip a Cloudflare 524 on large `wp_posts` / `wp_postmeta`). Indexes are recorded as pending and built lazily, one at a time, on later admin loads. The plugin works fully — just unindexed — until they exist.
+**Other features**
 
-## Requirements
+* Elementor-aware quick actions.
+* Bulk actions, chunked client-side so large operations don't time out.
+* Duplicate finder for titles, exact slugs and similar slugs.
+* CSV export of the current view or a selection.
+* WP-CLI command to build the search indexes on demand.
 
-- WordPress 6.0 or later
-- PHP 7.4 or later
-- MySQL / MariaDB with InnoDB FULLTEXT support (MySQL 5.6+ / MariaDB 10.0.5+)
+**Indexing is safe on large tables**
 
-## Installation
+The plugin never runs a long `ALTER TABLE` during activation. Instead it records that indexes are pending and builds them lazily, one at a time, on later admin loads (or immediately via WP-CLI). The plugin is fully usable while indexing is in progress — search simply runs in a basic mode until the FULLTEXT indexes exist.
 
-1. Download the latest release (or clone this repo).
-2. Upload the `scalable-page-manager` folder to `wp-content/plugins/`, or zip it and install via **Plugins → Add New → Upload Plugin**.
-3. Activate through the **Plugins** menu in WordPress.
-4. Open the **Scalable Page Manager** admin menu item. On first loads the FULLTEXT indexes build lazily in the background; search is fully functional (falling back to unindexed matching) until they complete.
+== Installation ==
 
-## REST API
+1. Upload the `scalable-page-manager` folder to `/wp-content/plugins/`, or install the plugin through the Plugins screen in WordPress.
+2. Activate the plugin through the Plugins screen.
+3. Open **Pages (Scalable)** in the admin menu.
+4. On large sites, optionally run `wp spm build-indexes` via WP-CLI to build the search indexes immediately instead of waiting for them to build in the background.
 
-All endpoints live under the `spm/v1` namespace and require appropriate capabilities:
+== Frequently Asked Questions ==
 
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /pages` | Keyset-paginated list |
-| `GET /tree/{parent}` | Lazy children of a node |
-| `GET /search` | Tiered indexed search |
-| `GET /stats` | Dataset stats |
-| `GET /page/{id}` | Single page detail |
-| `POST /page/{id}/edit` | Inline edit |
-| `POST /action` | Bulk / single actions |
-| `GET /duplicates` | Duplicate detection |
-| `GET /parents` | Parent options |
-| `GET /export` | Export current view |
-| `GET/POST /default-view` | Saved default view |
+= Does this add database indexes to my site? =
 
-## Notes
+Yes. It adds a small number of composite and FULLTEXT indexes to `wp_posts` and `wp_postmeta` to make search and sorting fast. They are created lazily, one per request, so activation is instant and no request runs long enough to time out.
 
-Content/ACF FULLTEXT matching only runs when the relevant index is present; the plugin detects this and falls back gracefully to unindexed matching if the indexes have not finished building. `MATCH ... AGAINST` uses BOOLEAN MODE.
+= Does it work without the indexes? =
 
-## License
+Yes. Until the indexes finish building, search falls back to a bounded, basic mode. Everything else works normally.
 
-GPL-2.0-or-later. See [LICENSE](LICENSE).
+= Which capability is required? =
+
+All actions require the `edit_pages` capability, checked on every REST route.
+
+= Does it modify my content? =
+
+No. Read operations never load post content into PHP. Edit and bulk actions use standard WordPress functions and respect per-page capabilities.
+
+== Screenshots ==
+
+1. The scalable page list with virtual scrolling and quick actions.
+2. Lazy-loading page hierarchy tree.
+3. Tiered search across titles, slugs, content and ACF fields.
+4. Duplicate finder.
+
+== Changelog ==
+
+= 1.5.0 =
+* Keyset pagination, lazy tree, tiered FULLTEXT search, virtual scrolling.
+* Duplicate finder for titles, exact slugs and similar slugs.
+* CSV export with formula-injection guarding.
+* Lazy, timeout-safe index building with a WP-CLI command.
+
+== Upgrade Notice ==
+
+= 1.5.0 =
+Initial public release.
