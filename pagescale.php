@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       PageScale
  * Plugin URI:        https://github.com/Shahzeb2u/scalable-page-manager
- * Description:        High-performance page management for sites with 10,000+ pages. Lazy tree, virtual-scroll list, keyset pagination, indexed FULLTEXT search across title, slug, content and ACF fields. Elementor-aware quick actions.
- * Version:           1.5.1
+ * Description:        High-performance manager for sites with 10,000+ pages or custom post type entries. Choose which post types to manage; hierarchical types get a lazy tree, flat types get a virtual-scroll list. Keyset pagination, indexed FULLTEXT search across title, slug, content and ACF fields. Elementor-aware quick actions.
+ * Version:           1.6.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Shahzaib Rasheed
@@ -32,10 +32,107 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'PGSCL_VERSION', '1.5.1' );
+define( 'PGSCL_VERSION', '1.6.0' );
 define( 'PGSCL_DB_VERSION', '1' );
 define( 'PGSCL_FILE', __FILE__ );
 define( 'PGSCL_SLUG', 'pagescale' );
+define( 'PGSCL_PT_OPTION', 'pgscl_post_types' );
+define( 'PGSCL_DEFAULT_PT', 'page' );
+
+/* ===========================================================================
+ * POST-TYPE CONTEXT (v1.6.0 — CPT support)
+ * ---------------------------------------------------------------------------
+ * PageScale historically managed only the 'page' post type. As of 1.6.0 the
+ * admin can opt additional post types in via the Settings screen. To keep
+ * existing installs byte-identical, the managed list DEFAULTS to array('page')
+ * and every query still falls back to 'page' when no valid type is supplied.
+ * ======================================================================== */
+
+/**
+ * The post types PageScale is configured to manage. Always includes at least
+ * 'page' unless the admin has deliberately chosen a different set. Filtered to
+ * types that (a) still exist and (b) are shown in the admin UI.
+ *
+ * @return string[] List of post-type slugs (never empty).
+ */
+function pgscl_managed_post_types() {
+	$stored = get_option( PGSCL_PT_OPTION, array( PGSCL_DEFAULT_PT ) );
+	if ( ! is_array( $stored ) || empty( $stored ) ) {
+		$stored = array( PGSCL_DEFAULT_PT );
+	}
+	$valid = array();
+	foreach ( $stored as $pt ) {
+		$pt = sanitize_key( $pt );
+		if ( $pt && post_type_exists( $pt ) ) {
+			$valid[] = $pt;
+		}
+	}
+	if ( empty( $valid ) ) {
+		$valid = array( PGSCL_DEFAULT_PT );
+	}
+	return array_values( array_unique( $valid ) );
+}
+
+/**
+ * All post types the admin is ALLOWED to choose from on the settings screen:
+ * every public post type shown in the admin UI, excluding attachments.
+ *
+ * @return WP_Post_Type[] keyed by slug.
+ */
+function pgscl_selectable_post_types() {
+	$types = get_post_types( array( 'show_ui' => true ), 'objects' );
+	unset( $types['attachment'] );
+	return $types;
+}
+
+/**
+ * Resolve the post type a REST request should operate on. Validates the
+ * requested type against the managed list; falls back to the first managed
+ * type (or 'page') so a bad/empty value can never widen scope.
+ *
+ * @param WP_REST_Request|string|null $req Request or raw post_type string.
+ * @return string A safe, managed post-type slug.
+ */
+function pgscl_current_post_type( $req = null ) {
+	$managed = pgscl_managed_post_types();
+	$requested = '';
+	if ( $req instanceof WP_REST_Request ) {
+		$requested = sanitize_key( (string) $req->get_param( 'post_type' ) );
+	} elseif ( is_string( $req ) ) {
+		$requested = sanitize_key( $req );
+	}
+	if ( $requested && in_array( $requested, $managed, true ) ) {
+		return $requested;
+	}
+	// Fall back to the first managed type, preferring 'page' if present.
+	if ( in_array( PGSCL_DEFAULT_PT, $managed, true ) ) {
+		return PGSCL_DEFAULT_PT;
+	}
+	return $managed[0];
+}
+
+/**
+ * Whether a post type uses parent/child hierarchy (tree view) or is flat
+ * (virtual list only). Wraps core; kept as a helper so call sites read clearly.
+ *
+ * @param string $pt Post-type slug.
+ * @return bool
+ */
+function pgscl_post_type_is_hierarchical( $pt ) {
+	return (bool) is_post_type_hierarchical( $pt );
+}
+
+/**
+ * The capability object for a post type, used for permission checks that were
+ * previously hardcoded to page capabilities (edit_pages, delete_pages, …).
+ *
+ * @param string $pt Post-type slug.
+ * @return object|null Capabilities object, or null if the type is gone.
+ */
+function pgscl_pt_caps( $pt ) {
+	$obj = get_post_type_object( $pt );
+	return $obj ? $obj->cap : null;
+}
 
 /*
  * This plugin is, by design, a high-volume page manager that queries the core
@@ -221,15 +318,141 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 
 add_action( 'admin_menu', 'pgscl_register_menu' );
 
+/** Add a “Settings” link on the Plugins screen row. */
+add_filter( 'plugin_action_links_' . plugin_basename( PGSCL_FILE ), 'pgscl_action_links' );
+function pgscl_action_links( $links ) {
+	$url = admin_url( 'options-general.php?page=' . PGSCL_SLUG . '_settings' );
+	$settings = '<a href="' . esc_url( $url ) . '">' . esc_html__( 'Settings', 'pagescale' ) . '</a>';
+	array_unshift( $links, $settings );
+	return $links;
+}
+
 function pgscl_register_menu() {
-	add_submenu_page(
-		'edit.php?post_type=page',
-		__( 'Pages (Scalable)', 'pagescale' ),
-		__( 'Scalable Manager', 'pagescale' ),
-		'edit_pages',
-		PGSCL_SLUG,
-		'pgscl_render_admin_page'
+	$managed = pgscl_managed_post_types();
+
+	// Add the manager under EACH managed post type's admin menu, so it appears
+	// beside the native list for pages, products, etc. The same screen adapts
+	// to whichever post type it was opened from (via the ?pt= query arg).
+	foreach ( $managed as $pt ) {
+		$obj = get_post_type_object( $pt );
+		if ( ! $obj ) {
+			continue;
+		}
+		// WordPress menu parents differ by type: Posts lives under 'edit.php',
+		// Pages and every other type under 'edit.php?post_type=<slug>'. Using
+		// the wrong parent makes add_submenu_page() silently do nothing.
+		if ( 'post' === $pt ) {
+			$parent = 'edit.php';
+		} else {
+			$parent = 'edit.php?post_type=' . $pt;
+		}
+		$cap    = isset( $obj->cap->edit_posts ) ? $obj->cap->edit_posts : 'edit_posts';
+		add_submenu_page(
+			$parent,
+			/* translators: %s: post type label */
+			sprintf( __( '%s (Scalable)', 'pagescale' ), $obj->labels->name ),
+			__( 'Scalable Manager', 'pagescale' ),
+			$cap,
+			PGSCL_SLUG . ( 'page' === $pt ? '' : '_' . $pt ),
+			'pgscl_render_admin_page'
+		);
+	}
+
+	// Settings page (under Settings menu).
+	add_options_page(
+		__( 'PageScale', 'pagescale' ),
+		__( 'PageScale', 'pagescale' ),
+		'manage_options',
+		PGSCL_SLUG . '_settings',
+		'pgscl_render_settings_page'
 	);
+}
+
+/* ===========================================================================
+ * SETTINGS — choose which post types PageScale manages
+ * ======================================================================== */
+add_action( 'admin_init', 'pgscl_register_settings' );
+function pgscl_register_settings() {
+	register_setting(
+		'pgscl_settings_group',
+		PGSCL_PT_OPTION,
+		array(
+			'type'              => 'array',
+			'sanitize_callback' => 'pgscl_sanitize_post_types',
+			'default'           => array( PGSCL_DEFAULT_PT ),
+		)
+	);
+}
+
+/**
+ * Sanitize the submitted post-type list: keep only real, selectable types.
+ * Always guarantees at least one valid type ('page') so the plugin never ends
+ * up managing nothing.
+ *
+ * @param mixed $value Raw submitted value.
+ * @return string[]
+ */
+function pgscl_sanitize_post_types( $value ) {
+	$selectable = array_keys( pgscl_selectable_post_types() );
+	$out = array();
+	foreach ( (array) $value as $pt ) {
+		$pt = sanitize_key( $pt );
+		if ( $pt && in_array( $pt, $selectable, true ) ) {
+			$out[] = $pt;
+		}
+	}
+	$out = array_values( array_unique( $out ) );
+	if ( empty( $out ) ) {
+		$out = array( PGSCL_DEFAULT_PT );
+	}
+	// A post-type set change alters which submenus appear; flush is not needed
+	// but clear our count caches so stale totals don't linger.
+	pgscl_bust_total_cache();
+	return $out;
+}
+
+/** Render the settings screen. */
+function pgscl_render_settings_page() {
+	if ( ! current_user_can( 'manage_options' ) ) {
+		return;
+	}
+	$managed    = pgscl_managed_post_types();
+	$selectable = pgscl_selectable_post_types();
+	?>
+	<div class="wrap">
+		<h1><?php esc_html_e( 'PageScale Settings', 'pagescale' ); ?></h1>
+		<p><?php esc_html_e( 'Choose which post types PageScale should manage. Each selected type gets a “Scalable Manager” screen under its own menu. Pages is always available by default.', 'pagescale' ); ?></p>
+		<form method="post" action="options.php">
+			<?php settings_fields( 'pgscl_settings_group' ); ?>
+			<table class="form-table" role="presentation">
+				<tr>
+					<th scope="row"><?php esc_html_e( 'Managed post types', 'pagescale' ); ?></th>
+					<td>
+						<fieldset>
+						<?php foreach ( $selectable as $slug => $obj ) :
+							$checked  = in_array( $slug, $managed, true );
+							$is_hier  = is_post_type_hierarchical( $slug );
+							?>
+							<label style="display:block;margin:4px 0;">
+								<input type="checkbox" name="<?php echo esc_attr( PGSCL_PT_OPTION ); ?>[]" value="<?php echo esc_attr( $slug ); ?>" <?php checked( $checked ); ?> />
+								<strong><?php echo esc_html( $obj->labels->name ); ?></strong>
+								<code><?php echo esc_html( $slug ); ?></code>
+								<span style="color:#666;">
+									<?php echo $is_hier
+										? esc_html__( '— hierarchical (tree view)', 'pagescale' )
+										: esc_html__( '— flat (list view)', 'pagescale' ); ?>
+								</span>
+							</label>
+						<?php endforeach; ?>
+						</fieldset>
+						<p class="description"><?php esc_html_e( 'Hierarchical types (like Pages) show a parent/child tree. Non-hierarchical types (like Posts or Products) show a fast flat list.', 'pagescale' ); ?></p>
+					</td>
+				</tr>
+			</table>
+			<?php submit_button(); ?>
+		</form>
+	</div>
+	<?php
 }
 
 /**
@@ -258,37 +481,97 @@ function pgscl_enqueue_assets( $hook ) {
 /**
  * Build the boot-data array passed to the front-end app.
  */
+/**
+ * Which post type the current admin screen is managing. Derived from the
+ * submenu page slug: 'pagescale' → page; 'pagescale_<pt>' → that type.
+ * Always returns a managed type (defaults to 'page').
+ *
+ * @return string
+ */
+function pgscl_admin_current_pt() {
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- read-only screen routing, no state change.
+	$page = isset( $_GET['page'] ) ? sanitize_key( wp_unslash( $_GET['page'] ) ) : '';
+	$managed = pgscl_managed_post_types();
+	if ( $page === PGSCL_SLUG ) {
+		return in_array( PGSCL_DEFAULT_PT, $managed, true ) ? PGSCL_DEFAULT_PT : $managed[0];
+	}
+	$prefix = PGSCL_SLUG . '_';
+	if ( 0 === strpos( $page, $prefix ) ) {
+		$pt = substr( $page, strlen( $prefix ) );
+		if ( in_array( $pt, $managed, true ) ) {
+			return $pt;
+		}
+	}
+	return in_array( PGSCL_DEFAULT_PT, $managed, true ) ? PGSCL_DEFAULT_PT : $managed[0];
+}
+
 function pgscl_get_boot_data() {
+	$pt  = pgscl_admin_current_pt();
+	$obj = get_post_type_object( $pt );
+	$caps = $obj ? $obj->cap : null;
 	return array(
 		'root'      => esc_url_raw( rest_url( 'pagescale/v1' ) ),
 		'nonce'     => wp_create_nonce( 'wp_rest' ),
 		'editBase'  => admin_url( 'post.php' ),
-		'newUrl'    => admin_url( 'post-new.php?post_type=page' ),
+		'newUrl'    => admin_url( 'post-new.php?post_type=' . $pt ),
+		'postType'  => $pt,
+		'ptLabel'   => $obj ? $obj->labels->name : ucfirst( $pt ),
+		'ptSingular'=> $obj ? $obj->labels->singular_name : ucfirst( $pt ),
+		'hierarchical' => pgscl_post_type_is_hierarchical( $pt ),
+		'managedTypes' => pgscl_boot_managed_types(),
 		'elementor' => pgscl_elementor_active(),
 		'statuses'  => array( 'publish', 'draft', 'pending', 'private', 'future', 'trash' ),
 		'templates' => pgscl_get_page_templates(),
 		'authors'   => pgscl_get_page_authors(),
-		'taxes'     => pgscl_get_page_taxonomies(),
+		'taxes'     => pgscl_get_page_taxonomies( $pt ),
 		'seoPlugin' => pgscl_seo_plugin(),
-		'canDelete' => current_user_can( 'delete_pages' ),
-		'templateTax'      => pgscl_get_template_taxonomy_name(),
+		'canDelete' => $caps ? current_user_can( $caps->delete_posts ) : current_user_can( 'delete_pages' ),
+		'templateTax'      => pgscl_get_template_taxonomy_name( $pt ),
 		'templateTaxLabel' => pgscl_get_template_taxonomy_label(),
 		'templateTaxTerms' => pgscl_get_template_taxonomy_terms(),
-		// All registered page taxonomy slugs — shown in warning to help admin identify correct slug.
-		'allPageTaxes'     => array_keys( get_object_taxonomies( 'page' ) ),
+		// All registered taxonomy slugs for this type — shown in a warning to help admin identify correct slug.
+		'allPageTaxes'     => array_keys( get_object_taxonomies( $pt ) ),
 		'indexStatus'      => get_option( 'pgscl_index_status', 'done' ),
 	);
 }
 
+/** Managed types as {slug,label,url,hierarchical} for the UI switcher. */
+function pgscl_boot_managed_types() {
+	$out = array();
+	foreach ( pgscl_managed_post_types() as $pt ) {
+		$obj = get_post_type_object( $pt );
+		if ( ! $obj ) {
+			continue;
+		}
+		$slug = ( 'page' === $pt ) ? PGSCL_SLUG : PGSCL_SLUG . '_' . $pt;
+		$out[] = array(
+			'postType'     => $pt,
+			'label'        => $obj->labels->name,
+			'url'          => admin_url( 'admin.php?page=' . $slug ),
+			'hierarchical' => pgscl_post_type_is_hierarchical( $pt ),
+		);
+	}
+	return $out;
+}
+
 function pgscl_render_admin_page() {
-	if ( ! current_user_can( 'edit_pages' ) ) {
-		wp_die( esc_html__( 'You do not have permission to manage pages.', 'pagescale' ) );
+	$pt   = pgscl_admin_current_pt();
+	$obj  = get_post_type_object( $pt );
+	$cap  = ( $obj && isset( $obj->cap->edit_posts ) ) ? $obj->cap->edit_posts : 'edit_pages';
+	if ( ! current_user_can( $cap ) ) {
+		wp_die( esc_html__( 'You do not have permission to use this manager.', 'pagescale' ) );
 	}
 
-	$boot = pgscl_get_boot_data();
+	$boot  = pgscl_get_boot_data();
+	$label = $obj ? $obj->labels->name : __( 'Pages', 'pagescale' );
 	?>
 	<div class="wrap">
-		<h1 class="wp-heading-inline"><?php esc_html_e( 'Pages (Scalable)', 'pagescale' ); ?></h1>
+		<h1 class="wp-heading-inline">
+			<?php
+			/* translators: %s: post type label (e.g. Pages, Products). */
+			echo esc_html( sprintf( __( '%s (Scalable)', 'pagescale' ), $label ) );
+			?>
+		</h1>
 		<a href="<?php echo esc_url( $boot['newUrl'] ); ?>" class="page-title-action"><?php esc_html_e( 'Add New', 'pagescale' ); ?></a>
 		<hr class="wp-header-end">
 		<?php if ( 'done' !== $boot['indexStatus'] ) : ?>
@@ -331,9 +614,9 @@ function pgscl_get_page_authors() {
 	return $out;
 }
 
-function pgscl_get_page_taxonomies() {
+function pgscl_get_page_taxonomies( $pt = PGSCL_DEFAULT_PT ) {
 	$out = array();
-	foreach ( get_object_taxonomies( 'page', 'objects' ) as $tax ) {
+	foreach ( get_object_taxonomies( $pt, 'objects' ) as $tax ) {
 		if ( ! $tax->show_ui ) {
 			continue;
 		}
@@ -405,15 +688,15 @@ function pgscl_get_page_taxonomies() {
  * If auto-detection keeps failing, add to functions.php:
  *   add_filter( 'pgscl_template_taxonomy', fn() => 'your_exact_taxonomy_slug' );
  */
-function pgscl_get_template_taxonomy_name() {
+function pgscl_get_template_taxonomy_name( $pt = PGSCL_DEFAULT_PT ) {
 	// 1. Explicit override.
 	$override = (string) apply_filters( 'pgscl_template_taxonomy', '' );
 	if ( $override && taxonomy_exists( $override ) ) {
 		return $override;
 	}
 
-	// 2. Auto-detect from all taxonomies registered on the 'page' post type.
-	foreach ( get_object_taxonomies( 'page', 'objects' ) as $tax ) {
+	// 2. Auto-detect from all taxonomies registered on the selected post type.
+	foreach ( get_object_taxonomies( $pt, 'objects' ) as $tax ) {
 		$slug   = strtolower( $tax->name );
 		$label  = strtolower( $tax->label ?? '' );
 		$single = strtolower( $tax->labels->singular_name ?? '' );
@@ -515,8 +798,13 @@ function pgscl_get_template_taxonomy_terms() {
 
 add_action( 'rest_api_init', 'pgscl_register_routes' );
 
-function pgscl_can_edit_pages() {
-	return current_user_can( 'edit_pages' );
+function pgscl_can_edit_pages( $req = null ) {
+	// Resolve the post type being requested and check THAT type's edit cap, so
+	// access to one managed type never implies access to another.
+	$pt   = pgscl_current_post_type( $req );
+	$caps = pgscl_pt_caps( $pt );
+	$cap  = ( $caps && isset( $caps->edit_posts ) ) ? $caps->edit_posts : 'edit_pages';
+	return current_user_can( $cap );
 }
 
 /**
@@ -567,7 +855,10 @@ function pgscl_register_routes() {
 	) );
 
 	register_rest_route( 'pagescale/v1', '/page/(?P<id>\d+)', array(
-		'methods'             => 'PATCH',
+		// EDITABLE = POST, PUT, PATCH. Many LiteSpeed/ModSecurity hosts block
+		// the PATCH method at the server level (the request never reaches
+		// WordPress), so the client sends POST and we accept all three.
+		'methods'             => WP_REST_Server::EDITABLE,
 		'callback'            => 'pgscl_rest_quick_edit',
 		'permission_callback' => $perm,
 		'args'                => array( 'id' => array( 'sanitize_callback' => 'absint' ) ),
@@ -635,8 +926,9 @@ const PGSCL_STATUSES = array( 'publish', 'draft', 'pending', 'private', 'future'
 function pgscl_build_filters( WP_REST_Request $req ) {
 	global $wpdb;
 
-	$where  = array( "p.post_type = 'page'" );
-	$params = array();
+	$pt     = pgscl_current_post_type( $req );
+	$where  = array( 'p.post_type = %s' );
+	$params = array( $pt );
 	$join   = '';
 
 	// Status.
@@ -672,11 +964,13 @@ function pgscl_build_filters( WP_REST_Request $req ) {
 
 	if ( $parent_slug ) {
 		// Resolve slug → ID via sub-select (post_name is indexed).
-		$join    .= " INNER JOIN {$wpdb->posts} pp ON pp.ID = p.post_parent AND pp.post_type = 'page' AND pp.post_name = %s";
+		$join    .= " INNER JOIN {$wpdb->posts} pp ON pp.ID = p.post_parent AND pp.post_type = %s AND pp.post_name = %s";
+		$params[] = $pt;
 		$params[] = $parent_slug;
 	} elseif ( $parent_title ) {
 		// Resolve by title prefix — FULLTEXT on title index.
-		$join    .= " INNER JOIN {$wpdb->posts} ppt ON ppt.ID = p.post_parent AND ppt.post_type = 'page' AND ppt.post_title LIKE %s";
+		$join    .= " INNER JOIN {$wpdb->posts} ppt ON ppt.ID = p.post_parent AND ppt.post_type = %s AND ppt.post_title LIKE %s";
+		$params[] = $pt;
 		$params[] = $wpdb->esc_like( $parent_title ) . '%';
 	} elseif ( null !== $parent && '' !== $parent && (int) $parent >= 0 ) {
 		$where[]  = 'p.post_parent = %d';
@@ -995,8 +1289,8 @@ function pgscl_rest_export( WP_REST_Request $req ) {
 			$ph  = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 			$sql = "SELECT p.ID, p.post_title, p.post_name, p.post_status, p.post_author, p.post_parent, p.post_date, p.post_modified
 			        FROM {$wpdb->posts} p
-			        WHERE p.post_type = 'page' AND p.ID IN ({$ph})";
-			$db  = $wpdb->get_results( $wpdb->prepare( $sql, $ids ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $sql uses a machine-built %d placeholder list; ids bound via prepare().
+			        WHERE p.post_type = %s AND p.ID IN ({$ph})";
+			$db  = $wpdb->get_results( $wpdb->prepare( $sql, array_merge( array( pgscl_current_post_type( $req ) ), $ids ) ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $sql uses a machine-built %d placeholder list; ids bound via prepare().
 
 			// Never export a private page the current user may not read, even
 			// when its ID is supplied directly.
@@ -1123,13 +1417,18 @@ function pgscl_csv_safe_cell( $value ) {
 function pgscl_rest_stats( WP_REST_Request $req ) {
 	global $wpdb;
 
-	// Total non-trash pages, cached for 5 minutes (invalidate-on-write optional).
-	$total = get_transient( 'pgscl_total_pages' );
+	$pt = pgscl_current_post_type( $req );
+
+	// Total non-trash items for this post type, cached 5 min. The cache key is
+	// per-post-type so counts never bleed across types (e.g. page vs product).
+	$cache_key = 'pgscl_total_' . $pt;
+	$total = get_transient( $cache_key );
 	if ( false === $total ) {
-		$total = (int) $wpdb->get_var(
-			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type='page' AND post_status<>'trash'"
-		);
-		set_transient( 'pgscl_total_pages', $total, 5 * MINUTE_IN_SECONDS );
+		$total = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type=%s AND post_status<>'trash'",
+			$pt
+		) );
+		set_transient( $cache_key, $total, 5 * MINUTE_IN_SECONDS );
 	}
 
 	// Filtered count using the same WHERE builder as the list.
@@ -1153,9 +1452,10 @@ function pgscl_rest_tree( WP_REST_Request $req ) {
 	$children = $wpdb->get_results( $wpdb->prepare(
 		"SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
 		 FROM {$wpdb->posts}
-		 WHERE post_type='page' AND post_status<>'trash' AND post_parent=%d
+		 WHERE post_type=%s AND post_status<>'trash' AND post_parent=%d
 		 ORDER BY menu_order ASC, post_title ASC
 		 LIMIT 500",
+		pgscl_current_post_type( $req ),
 		$parent
 	), ARRAY_A );
 
@@ -1173,8 +1473,8 @@ function pgscl_rest_tree( WP_REST_Request $req ) {
 	$ph  = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 	$kids = $wpdb->get_col( $wpdb->prepare(
 		"SELECT DISTINCT post_parent FROM {$wpdb->posts}
-		 WHERE post_type='page' AND post_status<>'trash' AND post_parent IN ({$ph})",
-		$ids
+		 WHERE post_type=%s AND post_status<>'trash' AND post_parent IN ({$ph})",
+		array_merge( array( pgscl_current_post_type( $req ) ), $ids )
 	) );
 	$has = array_flip( array_map( 'intval', $kids ) );
 
@@ -1193,6 +1493,8 @@ function pgscl_rest_tree( WP_REST_Request $req ) {
 
 function pgscl_rest_search( WP_REST_Request $req ) {
 	global $wpdb;
+
+	$pt = pgscl_current_post_type( $req );
 
 	// ── FEATURE 1: hand off to the child-expansion path when requested. ──
 	if ( 'children' === sanitize_key( (string) $req->get_param( 'scope' ) ) ) {
@@ -1223,13 +1525,15 @@ function pgscl_rest_search( WP_REST_Request $req ) {
 			if ( $slug ) {
 				$rows = $wpdb->get_results( $wpdb->prepare(
 					"SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
-					 FROM {$wpdb->posts} WHERE post_type='page' AND post_name = %s LIMIT 20",
+					 FROM {$wpdb->posts} WHERE post_type=%s AND post_name = %s LIMIT 20",
+					$pt,
 					sanitize_title( $slug )
 				), ARRAY_A );
 				if ( ! $rows ) {
 					$rows = $wpdb->get_results( $wpdb->prepare(
 						"SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
-						 FROM {$wpdb->posts} WHERE post_type='page' AND post_name LIKE %s LIMIT 40",
+						 FROM {$wpdb->posts} WHERE post_type=%s AND post_name LIKE %s LIMIT 40",
+						$pt,
 						$wpdb->esc_like( sanitize_title( $slug ) ) . '%'
 					), ARRAY_A );
 				}
@@ -1243,8 +1547,9 @@ function pgscl_rest_search( WP_REST_Request $req ) {
 	if ( ( 'id' === $field || 'auto' === $field || '' === $field ) && ctype_digit( $q ) ) {
 		$row = $wpdb->get_row( $wpdb->prepare(
 			"SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
-			 FROM {$wpdb->posts} WHERE ID=%d AND post_type='page'",
-			(int) $q
+			 FROM {$wpdb->posts} WHERE ID=%d AND post_type=%s",
+			(int) $q,
+			$pt
 		), ARRAY_A );
 		$row = ( $row && pgscl_filter_readable( array( $row ) ) ) ? $row : null;
 		return rest_ensure_response( array( 'rows' => $row ? array( pgscl_shape_row( $row ) ) : array() ) );
@@ -1254,14 +1559,14 @@ function pgscl_rest_search( WP_REST_Request $req ) {
 	if ( 'slug' === $field ) {
 		if ( $exact ) {
 			$sql = "SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
-			        FROM {$wpdb->posts} WHERE post_type='page' AND post_name=%s LIMIT 60";
+			        FROM {$wpdb->posts} WHERE post_type=%s AND post_name=%s LIMIT 60";
 			$arg = $q;
 		} else {
 			$sql = "SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
-			        FROM {$wpdb->posts} WHERE post_type='page' AND post_name LIKE %s LIMIT 60";
+			        FROM {$wpdb->posts} WHERE post_type=%s AND post_name LIKE %s LIMIT 60";
 			$arg = $wpdb->esc_like( $q ) . '%';
 		}
-		$rows = $wpdb->get_results( $wpdb->prepare( $sql, $arg ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $sql is a static string with a %s placeholder; $arg bound via prepare().
+		$rows = $wpdb->get_results( $wpdb->prepare( $sql, $pt, $arg ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $sql is a static string with %s placeholders; values bound via prepare().
 		$rows = pgscl_filter_readable( $rows );
 		return rest_ensure_response( array( 'rows' => array_map( 'pgscl_shape_row', $rows ) ) );
 	}
@@ -1288,9 +1593,10 @@ function pgscl_rest_search( WP_REST_Request $req ) {
 		// those columns. We index them separately, so match each independently.
 		$ids_title = $wpdb->get_col( $wpdb->prepare(
 			"SELECT ID FROM {$wpdb->posts}
-			 WHERE post_type='page' AND post_status<>'trash'
+			 WHERE post_type=%s AND post_status<>'trash'
 			   AND MATCH(post_title) AGAINST(%s IN BOOLEAN MODE)
 			 LIMIT 200",
+			$pt,
 			$boolean
 		) );
 		$ids = array_merge( $ids, array_map( 'intval', (array) $ids_title ) );
@@ -1298,9 +1604,10 @@ function pgscl_rest_search( WP_REST_Request $req ) {
 		if ( $use_content ) {
 			$ids_content = $wpdb->get_col( $wpdb->prepare(
 				"SELECT ID FROM {$wpdb->posts}
-				 WHERE post_type='page' AND post_status<>'trash'
+				 WHERE post_type=%s AND post_status<>'trash'
 				   AND MATCH(post_content) AGAINST(%s IN BOOLEAN MODE)
 				 LIMIT 200",
+				$pt,
 				$boolean
 			) );
 			$ids = array_merge( $ids, array_map( 'intval', (array) $ids_content ) );
@@ -1313,10 +1620,11 @@ function pgscl_rest_search( WP_REST_Request $req ) {
 			"SELECT DISTINCT pm.post_id
 			 FROM {$wpdb->postmeta} pm
 			 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
-			 WHERE p.post_type='page' AND p.post_status<>'trash'
+			 WHERE p.post_type=%s AND p.post_status<>'trash'
 			   AND pm.meta_key NOT LIKE %s
 			   AND MATCH(pm.meta_value) AGAINST(%s IN BOOLEAN MODE)
 			 LIMIT 200",
+			$pt,
 			$wpdb->esc_like( '_' ) . '%', // skip protected/internal meta (e.g. _edit_lock)
 			$boolean
 		) );
@@ -1333,18 +1641,18 @@ function pgscl_rest_search( WP_REST_Request $req ) {
 			$like = $wpdb->get_results( $wpdb->prepare(
 				"SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
 				 FROM {$wpdb->posts}
-				 WHERE post_type='page' AND post_status<>'trash'
+				 WHERE post_type=%s AND post_status<>'trash'
 				   AND ( post_title LIKE %s OR post_content LIKE %s )
 				 ORDER BY post_title ASC LIMIT 60",
-				$like_q, $like_q
+				$pt, $like_q, $like_q
 			), ARRAY_A );
 		} else {
 			$like = $wpdb->get_results( $wpdb->prepare(
 				"SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
 				 FROM {$wpdb->posts}
-				 WHERE post_type='page' AND post_status<>'trash' AND post_title LIKE %s
+				 WHERE post_type=%s AND post_status<>'trash' AND post_title LIKE %s
 				 ORDER BY post_title ASC LIMIT 60",
-				$like_q
+				$pt, $like_q
 			), ARRAY_A );
 		}
 		$like = pgscl_filter_readable( $like );
@@ -1419,12 +1727,12 @@ function pgscl_search_children_of_matches( WP_REST_Request $req ) {
 	$children = $wpdb->get_results( $wpdb->prepare(
 		"SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
 		 FROM {$wpdb->posts}
-		 WHERE post_type = 'page'
+		 WHERE post_type = %s
 		   AND post_status <> 'trash'
 		   AND post_parent IN ({$ph})
 		 ORDER BY post_parent ASC, post_title ASC
 		 LIMIT 500",
-		$parent_ids
+		array_merge( array( pgscl_current_post_type( $req ) ), $parent_ids )
 	), ARRAY_A );
 
 	// Drop private children the current user cannot read.
@@ -1435,8 +1743,8 @@ function pgscl_search_children_of_matches( WP_REST_Request $req ) {
 	$parents = $wpdb->get_results( $wpdb->prepare(
 		"SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
 		 FROM {$wpdb->posts}
-		 WHERE post_type = 'page' AND ID IN ({$ph})",
-		$parent_ids
+		 WHERE post_type = %s AND ID IN ({$ph})",
+		array_merge( array( pgscl_current_post_type( $req ) ), $parent_ids )
 	), ARRAY_A );
 
 	// Drop private parent headers the current user cannot read.
@@ -1649,9 +1957,9 @@ function pgscl_rest_edit_data( WP_REST_Request $req ) {
 		return new WP_Error( 'pgscl_not_found', __( 'Page not found.', 'pagescale' ), array( 'status' => 404 ) );
 	}
 
-	// Assigned term IDs for every UI-visible page taxonomy.
+	// Assigned term IDs for every UI-visible taxonomy of this post's type.
 	$tax_assignments = array();
-	foreach ( get_object_taxonomies( 'page', 'objects' ) as $tax ) {
+	foreach ( get_object_taxonomies( $post->post_type, 'objects' ) as $tax ) {
 		if ( ! $tax->show_ui ) {
 			continue;
 		}
@@ -1693,7 +2001,15 @@ function pgscl_rest_quick_edit( WP_REST_Request $req ) {
 		$update['post_parent'] = absint( $body['parent'] );
 	}
 
-	$res = wp_update_post( $update, true );
+	// wp_update_post() expects slashed data (REST JSON arrives unslashed).
+	// Wrapped in try/catch because save hooks from page builders can throw on
+	// posts whose builder payload is corrupted — surface a clear error instead
+	// of a blank 500.
+	try {
+		$res = wp_update_post( wp_slash( $update ), true );
+	} catch ( \Throwable $t ) {
+		return new WP_Error( 'pgscl_update_failed', $t->getMessage(), array( 'status' => 400 ) );
+	}
 	if ( is_wp_error( $res ) ) {
 		return new WP_Error( 'pgscl_update_failed', $res->get_error_message(), array( 'status' => 400 ) );
 	}
@@ -1711,7 +2027,14 @@ function pgscl_rest_quick_edit( WP_REST_Request $req ) {
 		foreach ( $body['tax_terms'] as $entry ) {
 			$tax      = sanitize_key( $entry['taxonomy'] ?? '' );
 			$term_ids = array_map( 'absint', (array) ( $entry['term_ids'] ?? array() ) );
-			if ( $tax && taxonomy_exists( $tax ) && current_user_can( 'assign_terms', $tax ) ) {
+			if ( ! $tax || ! taxonomy_exists( $tax ) ) {
+				continue;
+			}
+			// Check the taxonomy's own mapped assign cap ('assign_terms' is not
+			// a literal capability — checking it directly always fails).
+			$tax_obj = get_taxonomy( $tax );
+			$cap     = ( $tax_obj && isset( $tax_obj->cap->assign_terms ) ) ? $tax_obj->cap->assign_terms : 'edit_posts';
+			if ( current_user_can( $cap ) ) {
 				wp_set_object_terms( $id, $term_ids, $tax );
 			}
 		}
@@ -1755,21 +2078,48 @@ function pgscl_rest_action( WP_REST_Request $req ) {
 			if ( ! current_user_can( 'delete_post', $id ) ) {
 				return new WP_Error( 'pgscl_forbidden', __( 'Not allowed.', 'pagescale' ), array( 'status' => 403 ) );
 			}
-			wp_trash_post( $id );
+			$res = wp_trash_post( $id );
+			if ( ! $res ) {
+				return new WP_Error( 'pgscl_trash_failed', __( 'Could not move the item to trash.', 'pagescale' ), array( 'status' => 400 ) );
+			}
 			return rest_ensure_response( array( 'ok' => true ) );
 
 		case 'untrash':
 			if ( ! current_user_can( 'delete_post', $id ) ) {
 				return new WP_Error( 'pgscl_forbidden', __( 'Not allowed.', 'pagescale' ), array( 'status' => 403 ) );
 			}
-			wp_untrash_post( $id );
+			$res = wp_untrash_post( $id );
+			if ( ! $res ) {
+				return new WP_Error( 'pgscl_untrash_failed', __( 'Could not restore the item.', 'pagescale' ), array( 'status' => 400 ) );
+			}
 			return rest_ensure_response( array( 'ok' => true ) );
 
 		case 'delete':
 			if ( ! current_user_can( 'delete_post', $id ) ) {
 				return new WP_Error( 'pgscl_forbidden', __( 'Not allowed.', 'pagescale' ), array( 'status' => 403 ) );
 			}
-			wp_delete_post( $id, true );
+			// Builder cleanup hooks (e.g. Elementor's before_delete_post handler)
+			// can throw when a post's builder payload is corrupted, aborting the
+			// delete mid-way. Catch that, strip the payload, and retry once
+			// through the normal API so the item can always be removed.
+			$deleted = false;
+			try {
+				$deleted = wp_delete_post( $id, true );
+			} catch ( \Throwable $t ) {
+				$deleted = false;
+			}
+			if ( ! $deleted ) {
+				delete_post_meta( $id, '_elementor_data' );
+				delete_post_meta( $id, '_elementor_css' );
+				try {
+					$deleted = wp_delete_post( $id, true );
+				} catch ( \Throwable $t ) {
+					$deleted = false;
+				}
+			}
+			if ( ! $deleted ) {
+				return new WP_Error( 'pgscl_delete_failed', __( 'Could not delete the item permanently.', 'pagescale' ), array( 'status' => 400 ) );
+			}
 			return rest_ensure_response( array( 'ok' => true ) );
 	}
 
@@ -1781,10 +2131,25 @@ function pgscl_duplicate_page( $id ) {
 	if ( ! $src ) {
 		return new WP_Error( 'pgscl_no_src', __( 'Source page not found.', 'pagescale' ) );
 	}
-	$new_id = wp_insert_post( array(
-		'post_type'      => 'page',
+	$src_type = $src->post_type; // Duplicate must be the SAME type as its source.
+
+	// Give the COPY a unique slug up front, leaving the source's slug untouched.
+	//
+	// wp_unique_post_slug() relaxes its check for 'draft' status (drafts are
+	// allowed to keep a colliding slug because core defers the real suffixing
+	// to publish time). That would make the copy keep the original slug, which
+	// is not what we want. We resolve uniqueness against 'publish' so the "-2"
+	// suffix is applied immediately, then create the post as a draft.
+	$base_slug = $src->post_name ? $src->post_name : sanitize_title( $src->post_title );
+	$new_slug  = wp_unique_post_slug( $base_slug, 0, 'publish', $src_type, $src->post_parent );
+
+	// wp_insert_post() expects slashed data; get_post() values are unslashed.
+	// Without wp_slash(), any backslash in the content is silently stripped.
+	$new_id = wp_insert_post( wp_slash( array(
+		'post_type'      => $src_type,
 		'post_status'    => 'draft',
 		'post_title'     => $src->post_title . ' (' . __( 'copy', 'pagescale' ) . ')',
+		'post_name'      => $new_slug,
 		'post_content'   => $src->post_content,
 		'post_excerpt'   => $src->post_excerpt,
 		'post_parent'    => $src->post_parent,
@@ -1792,25 +2157,53 @@ function pgscl_duplicate_page( $id ) {
 		'post_author'    => get_current_user_id(),
 		'comment_status' => $src->comment_status,
 		'ping_status'    => $src->ping_status,
-	), true );
+	) ), true );
 
 	if ( is_wp_error( $new_id ) ) {
 		return $new_id;
 	}
 
+	// wp_insert_post() runs its own slug uniqueness pass, and for 'draft' status
+	// it can relax the value back to the source's slug. Re-assert our computed
+	// unique slug directly so the copy keeps "-2" and the source is untouched.
+	$saved = get_post( $new_id );
+	if ( $saved && $saved->post_name !== $new_slug ) {
+		wp_update_post( array(
+			'ID'        => $new_id,
+			'post_name' => $new_slug,
+		) );
+	}
+
 	// Copy all meta (includes ACF + Elementor _elementor_data).
+	//
+	// CRITICAL: add_post_meta() expects slashed data and unslashes internally.
+	// Elementor stores its layout as a JSON string full of \" and \/ escapes;
+	// copying it unslashed strips those and corrupts the JSON, which breaks
+	// the duplicated page in Elementor. wp_slash() (recursive) prevents that,
+	// for JSON strings and serialized ACF values alike.
+	//
+	// Per-post builder caches are skipped so Elementor regenerates them for
+	// the new post ID instead of reusing stale CSS tied to the source post.
+	$skip = array(
+		'_wp_old_slug',
+		'_edit_lock',
+		'_edit_last',
+		'_elementor_css',
+		'_elementor_page_assets',
+		'_elementor_element_cache',
+	);
 	$meta = get_post_meta( $id );
 	foreach ( $meta as $key => $vals ) {
-		if ( '_wp_old_slug' === $key ) {
+		if ( in_array( $key, $skip, true ) ) {
 			continue;
 		}
 		foreach ( $vals as $v ) {
-			add_post_meta( $new_id, $key, maybe_unserialize( $v ) );
+			add_post_meta( $new_id, $key, wp_slash( maybe_unserialize( $v ) ) );
 		}
 	}
 
-	// Copy taxonomy terms.
-	foreach ( get_object_taxonomies( 'page' ) as $tax ) {
+	// Copy taxonomy terms for the source post's own type.
+	foreach ( get_object_taxonomies( $src_type ) as $tax ) {
 		$terms = wp_get_object_terms( $id, $tax, array( 'fields' => 'ids' ) );
 		if ( ! is_wp_error( $terms ) && $terms ) {
 			wp_set_object_terms( $new_id, $terms, $tax );
@@ -1845,6 +2238,7 @@ function pgscl_rest_duplicates( WP_REST_Request $req ) {
 	}
 
 	$posts = $wpdb->posts;
+	$pt    = pgscl_current_post_type( $req );
 
 	if ( 'title' === $mode ) {
 		/*
@@ -1853,14 +2247,16 @@ function pgscl_rest_duplicates( WP_REST_Request $req ) {
 		 * Step 2: fetch the actual pages for those titles, ordered so duplicates
 		 * are grouped together in the result.
 		 */
-		$dup_titles = $wpdb->get_col(
+		$dup_titles = $wpdb->get_col( $wpdb->prepare(
 			"SELECT LOWER(TRIM(post_title)) AS norm
 			 FROM {$posts}
-			 WHERE post_type='page' AND post_status <> 'trash' AND post_title <> ''
+			 WHERE post_type=%s AND post_status <> 'trash' AND post_title <> ''
 			 GROUP BY norm
 			 HAVING COUNT(*) > 1
-			 LIMIT {$limit}"
-		);
+			 LIMIT %d",
+			$pt,
+			$limit
+		) );
 
 		if ( ! $dup_titles ) {
 			return rest_ensure_response( array( 'rows' => array(), 'mode' => $mode, 'count' => 0 ) );
@@ -1871,11 +2267,11 @@ function pgscl_rest_duplicates( WP_REST_Request $req ) {
 			$wpdb->prepare(
 				"SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
 				 FROM {$posts}
-				 WHERE post_type='page' AND post_status <> 'trash'
+				 WHERE post_type=%s AND post_status <> 'trash'
 				   AND LOWER(TRIM(post_title)) IN ({$ph})
 				 ORDER BY LOWER(TRIM(post_title)) ASC, ID ASC
 				 LIMIT %d",
-				array_merge( $dup_titles, array( $limit * 10 ) )
+				array_merge( array( $pt ), $dup_titles, array( $limit * 10 ) )
 			),
 			ARRAY_A
 		);
@@ -1886,14 +2282,16 @@ function pgscl_rest_duplicates( WP_REST_Request $req ) {
 		 * because WordPress appends -2, -3 automatically — but they do appear
 		 * after migrations, imports, or manual DB edits.
 		 */
-		$dup_slugs = $wpdb->get_col(
+		$dup_slugs = $wpdb->get_col( $wpdb->prepare(
 			"SELECT post_name
 			 FROM {$posts}
-			 WHERE post_type='page' AND post_status <> 'trash' AND post_name <> ''
+			 WHERE post_type=%s AND post_status <> 'trash' AND post_name <> ''
 			 GROUP BY post_name
 			 HAVING COUNT(*) > 1
-			 LIMIT {$limit}"
-		);
+			 LIMIT %d",
+			$pt,
+			$limit
+		) );
 
 		if ( ! $dup_slugs ) {
 			return rest_ensure_response( array( 'rows' => array(), 'mode' => $mode, 'count' => 0 ) );
@@ -1904,11 +2302,11 @@ function pgscl_rest_duplicates( WP_REST_Request $req ) {
 			$wpdb->prepare(
 				"SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
 				 FROM {$posts}
-				 WHERE post_type='page' AND post_status <> 'trash'
+				 WHERE post_type=%s AND post_status <> 'trash'
 				   AND post_name IN ({$ph})
 				 ORDER BY post_name ASC, ID ASC
 				 LIMIT %d",
-				array_merge( $dup_slugs, array( $limit * 10 ) )
+				array_merge( array( $pt ), $dup_slugs, array( $limit * 10 ) )
 			),
 			ARRAY_A
 		);
@@ -1930,15 +2328,17 @@ function pgscl_rest_duplicates( WP_REST_Request $req ) {
 			$base_expr = 'LEFT(post_name, 40)';
 		}
 
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $base_expr is one of two hard-coded literal SQL expressions (no user input); $posts is a core table name; $limit is absint-bounded.
-		$dup_bases = $wpdb->get_col(
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- $base_expr is one of two hard-coded literal SQL expressions (no user input); $posts is a core table name; $pt and $limit are bound via prepare().
+		$dup_bases = $wpdb->get_col( $wpdb->prepare(
 			"SELECT {$base_expr} AS base
 			 FROM {$posts}
-			 WHERE post_type='page' AND post_status <> 'trash' AND post_name <> ''
+			 WHERE post_type=%s AND post_status <> 'trash' AND post_name <> ''
 			 GROUP BY base
 			 HAVING COUNT(*) > 1
-			 LIMIT {$limit}"
-		);
+			 LIMIT %d",
+			$pt,
+			$limit
+		) );
 
 		if ( ! $dup_bases ) {
 			return rest_ensure_response( array( 'rows' => array(), 'mode' => $mode, 'count' => 0 ) );
@@ -1953,7 +2353,7 @@ function pgscl_rest_duplicates( WP_REST_Request $req ) {
 		// static IN-style OR list. The number of placeholders matches $params, so
 		// the statement is fully prepared with no dynamic SQL text.
 		$like_clause = implode( ' OR ', array_fill( 0, count( $dup_bases ), 'post_name LIKE %s' ) );
-		$params      = array();
+		$params      = array( $pt );
 		foreach ( $dup_bases as $base ) {
 			$params[] = $wpdb->esc_like( $base ) . '%';
 		}
@@ -1961,7 +2361,7 @@ function pgscl_rest_duplicates( WP_REST_Request $req ) {
 
 		$sql = "SELECT ID, post_title, post_name, post_status, post_author, post_parent, post_date, post_modified
 			 FROM {$posts}
-			 WHERE post_type='page' AND post_status <> 'trash'
+			 WHERE post_type=%s AND post_status <> 'trash'
 			   AND ( {$like_clause} )
 			 ORDER BY post_name ASC, ID ASC
 			 LIMIT %d";
@@ -1995,6 +2395,11 @@ add_action( 'deleted_post', 'pgscl_bust_total_cache' );
 add_action( 'trashed_post', 'pgscl_bust_total_cache' );
 add_action( 'untrashed_post', 'pgscl_bust_total_cache' );
 function pgscl_bust_total_cache() {
+	// Clear the per-post-type total-count caches for every managed type.
+	foreach ( pgscl_managed_post_types() as $pt ) {
+		delete_transient( 'pgscl_total_' . $pt );
+	}
+	// Legacy key from < 1.6.0 (harmless if absent).
 	delete_transient( 'pgscl_total_pages' );
 	delete_transient( 'pgscl_parents_list' );
 }
@@ -2006,27 +2411,36 @@ function pgscl_bust_total_cache() {
 function pgscl_rest_parents( WP_REST_Request $req ) {
 	global $wpdb;
 
-	// Cache per-user: the readable set differs by capability/author, so a
-	// shared cache key could leak one user's private pages to another.
-	$cache_key = 'pgscl_parents_list_' . get_current_user_id();
+	$pt = pgscl_current_post_type( $req );
+
+	// Non-hierarchical types have no parent/child structure — return empty.
+	if ( ! pgscl_post_type_is_hierarchical( $pt ) ) {
+		return rest_ensure_response( array() );
+	}
+
+	// Cache per-user AND per-post-type: the readable set differs by
+	// capability/author (a shared key could leak private items), and the
+	// parent set differs per type.
+	$cache_key = 'pgscl_parents_' . $pt . '_' . get_current_user_id();
 	$cached    = get_transient( $cache_key );
 	if ( false !== $cached ) {
 		return rest_ensure_response( $cached );
 	}
 
-	$rows = $wpdb->get_results(
+	$rows = $wpdb->get_results( $wpdb->prepare(
 		"SELECT p.ID, p.post_title, p.post_name, p.post_status, p.post_author, p.post_modified,
 		        COUNT(c.ID) AS child_count
 		 FROM {$wpdb->posts} p
 		 INNER JOIN {$wpdb->posts} c ON c.post_parent = p.ID
-		                             AND c.post_type = 'page'
+		                             AND c.post_type = %s
 		                             AND c.post_status <> 'trash'
-		 WHERE p.post_type = 'page' AND p.post_status <> 'trash'
+		 WHERE p.post_type = %s AND p.post_status <> 'trash'
 		 GROUP BY p.ID
 		 ORDER BY child_count DESC, p.post_title ASC
 		 LIMIT 500",
-		ARRAY_A
-	);
+		$pt,
+		$pt
+	), ARRAY_A );
 
 	// Drop private parents the current user may not read (also hides their
 	// titles and child counts).
@@ -2086,7 +2500,20 @@ if ( ! defined( 'PGSCL_USER_JOURNEY_TAX' ) ) {
  */
 add_action( 'init', 'pgscl_register_user_journey_tax' );
 function pgscl_register_user_journey_tax() {
-	register_taxonomy( PGSCL_USER_JOURNEY_TAX, 'page', array(
+	// Attach to every managed HIERARCHICAL post type (the default view, which
+	// this taxonomy feeds, only applies to hierarchical types). Falls back to
+	// 'page' so existing installs are unchanged.
+	$targets = array();
+	foreach ( pgscl_managed_post_types() as $mpt ) {
+		if ( pgscl_post_type_is_hierarchical( $mpt ) ) {
+			$targets[] = $mpt;
+		}
+	}
+	if ( empty( $targets ) ) {
+		$targets = array( PGSCL_DEFAULT_PT );
+	}
+
+	register_taxonomy( PGSCL_USER_JOURNEY_TAX, $targets, array(
 		'label'             => __( 'User Journey', 'pagescale' ),
 		'labels'            => array(
 			'name'          => __( 'User Journey', 'pagescale' ),
@@ -2115,7 +2542,7 @@ function pgscl_register_user_journey_tax() {
  * Returns int[]. Only post_parent = 0 pages are eligible (Tier 2 is top-level).
  * Filterable via 'pgscl_user_journey_ids'.
  */
-function pgscl_user_journey_ids() {
+function pgscl_user_journey_ids( $pt = PGSCL_DEFAULT_PT ) {
 	global $wpdb;
 
 	if ( ! taxonomy_exists( PGSCL_USER_JOURNEY_TAX ) ) {
@@ -2127,10 +2554,11 @@ function pgscl_user_journey_ids() {
 		 FROM {$wpdb->posts} p
 		 INNER JOIN {$wpdb->term_relationships} tr ON tr.object_id = p.ID
 		 INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_taxonomy_id = tr.term_taxonomy_id
-		 WHERE p.post_type = 'page'
+		 WHERE p.post_type = %s
 		   AND p.post_status <> 'trash'
 		   AND p.post_parent = 0
 		   AND tt.taxonomy = %s",
+		$pt,
 		PGSCL_USER_JOURNEY_TAX
 	) );
 
@@ -2143,10 +2571,18 @@ function pgscl_user_journey_ids() {
 function pgscl_rest_default_view( WP_REST_Request $req ) {
 	global $wpdb;
 
+	$pt    = pgscl_current_post_type( $req );
 	$limit = max( 1, min( 500, (int) $req->get_param( 'limit' ) ?: 500 ) );
 
-	// One grouped query: every top-level page + its (non-trash) child count.
-	// LEFT JOIN so zero-child pages are included (Tier 4).
+	// The tiered default view is a hierarchical concept (top-level items + child
+	// counts). For non-hierarchical types there is no such structure, so signal
+	// the client to fall back to the normal flat list instead.
+	if ( ! pgscl_post_type_is_hierarchical( $pt ) ) {
+		return rest_ensure_response( array( 'unsupported' => true, 'reason' => 'non_hierarchical' ) );
+	}
+
+	// One grouped query: every top-level item + its (non-trash) child count.
+	// LEFT JOIN so zero-child items are included (Tier 4).
 	$rows = $wpdb->get_results( $wpdb->prepare(
 		"SELECT p.ID, p.post_title, p.post_name, p.post_status, p.post_author,
 		        p.post_parent, p.post_date, p.post_modified,
@@ -2154,24 +2590,26 @@ function pgscl_rest_default_view( WP_REST_Request $req ) {
 		 FROM {$wpdb->posts} p
 		 LEFT JOIN {$wpdb->posts} c
 		        ON c.post_parent = p.ID
-		       AND c.post_type = 'page'
+		       AND c.post_type = %s
 		       AND c.post_status <> 'trash'
-		 WHERE p.post_type = 'page'
+		 WHERE p.post_type = %s
 		   AND p.post_status <> 'trash'
 		   AND p.post_parent = 0
 		 GROUP BY p.ID
 		 LIMIT %d",
+		$pt,
+		$pt,
 		$limit
 	), ARRAY_A );
 
 	$rows = (array) $rows;
 
-	// Drop private top-level pages the current user may not read before they
+	// Drop private top-level items the current user may not read before they
 	// are tiered/returned.
 	$rows = pgscl_filter_readable( $rows );
 
 	$front_id    = (int) get_option( 'page_on_front' );
-	$journey_ids = array_flip( pgscl_user_journey_ids() );
+	$journey_ids = array_flip( pgscl_user_journey_ids( $pt ) );
 
 	$tier1 = array(); // homepage
 	$tier2 = array(); // journey guidance
@@ -2290,6 +2728,12 @@ function pgscl_get_styles() {
 	/* ── Parent folder grid ── */
 	.spm-parents-section{margin-bottom:12px}
 	.spm-parents-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+	.spm-pt-switch{display:flex;gap:4px;margin:0 0 12px;flex-wrap:wrap}
+	.spm-pt-tab{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border:1px solid #dcdcde;border-radius:6px;background:#fff;color:#2c3338;text-decoration:none;font-weight:600;font-size:13px}
+	.spm-pt-tab:hover{background:#f6f7f7;color:#2c3338}
+	.spm-pt-tab.active{background:#2271b1;border-color:#2271b1;color:#fff}
+	.spm-pt-kind{font-size:10px;text-transform:uppercase;letter-spacing:.04em;opacity:.6;font-weight:700}
+	.spm-pt-tab.active .spm-pt-kind{opacity:.85}
 	.spm-parents-header h3{margin:0;font-size:13px;font-weight:700;color:#1d2327}
 	.spm-parents-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px}
 	.spm-parent-card{background:#fff;border:1.5px solid #dcdcde;border-radius:8px;padding:10px 12px;cursor:pointer;transition:all .15s;display:flex;flex-direction:column;gap:4px;min-width:0;position:relative}
@@ -2429,6 +2873,11 @@ function pgscl_get_app_js() {
 	function api(path, opts){
 		opts = opts || {};
 		opts.headers = Object.assign({'X-WP-Nonce':B.nonce,'Content-Type':'application/json'}, opts.headers||{});
+		// Automatically scope every request to the current post type. Appended
+		// centrally so individual call sites never need to remember it.
+		if (B.postType) {
+			path += (path.indexOf('?') === -1 ? '?' : '&') + 'post_type=' + encodeURIComponent(B.postType);
+		}
 		return fetch(B.root+path, opts).then(function(r){
 			if(!r.ok) return r.json().then(function(e){throw e;});
 			return r.json();
@@ -2540,6 +2989,7 @@ function pgscl_get_app_js() {
 			delete q.limit; delete q.cursor; // export is unbounded (server-capped)
 			params=qs(q);
 		}
+		if(B.postType){ params += (params?'&':'') + 'post_type=' + encodeURIComponent(B.postType); }
 		if(btn){ btn.disabled=true; btn.classList.add('spm-busy'); }
 		toast('Preparing export…');
 		fetch(B.root+'/export?'+params, { headers:{'X-WP-Nonce':B.nonce} })
@@ -2604,6 +3054,9 @@ function pgscl_get_app_js() {
 		if(S.loading) return Promise.resolve();
 		S.loading=true; paintList();
 		return api('/default-view?limit=500').then(function(d){
+			// Non-hierarchical post types have no tiered top-level view; fall
+			// back to the normal flat list.
+			if(d && d.unsupported){ S.loading=false; return loadMore(); }
 			S.rows=d.rows; S.cursor=null; S.hasNext=false; S.loading=false;
 			paintList(); paintCount();
 		}).catch(function(){ S.loading=false; toast('Load failed'); paintList(); });
@@ -2611,8 +3064,9 @@ function pgscl_get_app_js() {
 
 	function initialFill(){
 		resetList(); loadStats();
-		// FEATURE 2: custom 4-tier top-level view when no search/filters are active.
-		if(isPristineDefault()){
+		// FEATURE 2: custom 4-tier top-level view when no search/filters are
+		// active — ONLY for hierarchical types. Flat types load the list.
+		if(B.hierarchical && isPristineDefault()){
 			return loadDefaultView();
 		}
 		var n=0;
@@ -2627,6 +3081,7 @@ function pgscl_get_app_js() {
 	 * Parents panel
 	 * ─────────────────────────────────────────────── */
 	function loadParents(){
+		if(!B.hierarchical) return; // flat types have no parent/child folders.
 		if(S.parents!==null){ paintParents(); return; }
 		api('/parents').then(function(data){
 			S.parents=data; paintParents();
@@ -2644,6 +3099,7 @@ function pgscl_get_app_js() {
 
 	function paintParents(){
 		var el=document.getElementById('spm-parents-panel'); if(!el) return;
+		if(!B.hierarchical){ el.innerHTML=''; return; } // no folders for flat types.
 		var parents=S.parents;
 		if(parents===null){ el.innerHTML='<div class="spm-loading">Loading parents…</div>'; return; }
 		if(!parents.length){ el.innerHTML=''; return; }
@@ -2787,7 +3243,7 @@ function pgscl_get_app_js() {
 	// Opens quick edit: fetches full per-page edit data (all taxonomies + SEO)
 	// then renders. editData is cached on S so re-renders don't refetch.
 	function openQuickEdit(id){
-		S.editing=id; QE_H=300; qeMeasured=false;
+		S.editing=id; S.editDraft=null; QE_H=300; qeMeasured=false;
 		S.editData=null; // show loading state until fetched
 		paintList(); ensureEditVisible();
 		api('/page/'+id+'/edit').then(function(d){
@@ -2833,10 +3289,12 @@ function pgscl_get_app_js() {
 			};
 		}
 
-		api('/page/'+id,{method:'PATCH',body:JSON.stringify(body)}).then(function(r){
+		// POST rather than PATCH: several hosting stacks (LiteSpeed/ModSecurity)
+		// drop PATCH requests at the server, so the save never reaches WP.
+		api('/page/'+id,{method:'POST',body:JSON.stringify(body)}).then(function(r){
 			var i=S.rows.findIndex(function(x){return x.id===id;});
 			if(i>-1) S.rows[i]=r;
-			S.editing=null; S.editData=null; qeMeasured=false; toast('Saved'); paintList();
+			S.editing=null; S.editData=null; S.editDraft=null; qeMeasured=false; toast('Saved'); paintList();
 		}).catch(function(e){ toast((e&&e.message)||'Save failed'); });
 	}
 
@@ -2844,6 +3302,32 @@ function pgscl_get_app_js() {
 	 * Row rendering
 	 * ─────────────────────────────────────────────── */
 	function statusBadge(s){ return '<span class="spm-badge '+esc(s)+'">'+esc(s)+'</span>'; }
+
+	// The list is a virtual scroller: every repaint rebuilds row HTML, which
+	// would reset an open quick-edit form to its fetched values and silently
+	// discard what the user has typed. Before each repaint we snapshot the
+	// form's live values into S.editDraft; the renderer prefers the draft.
+	function captureEditDraft(){
+		if(!S.editing) return;
+		var box=document.getElementById('spm-qe-'+S.editing);
+		if(!box) return;
+		var q=function(sel){ var el=box.querySelector(sel); return el?el.value:null; };
+		var d={
+			title:q('.qe-title'), slug:q('.qe-slug'), status:q('.qe-status'),
+			parent:q('.qe-parent-id'), tpl:q('.qe-tpl'),
+			seoTitle:q('.qe-seo-title'), seoDesc:q('.qe-seo-desc'),
+			seoFocus:q('.qe-seo-focus'), seoCanonical:q('.qe-seo-canonical'),
+			tax:{}, robots:null
+		};
+		box.querySelectorAll('input[data-tax]').forEach(function(cb){
+			var t=cb.getAttribute('data-tax');
+			if(!d.tax[t]) d.tax[t]={};
+			d.tax[t][cb.getAttribute('data-term')]=cb.checked;
+		});
+		var rb=box.querySelectorAll('input[data-robots]');
+		if(rb.length){ d.robots={}; rb.forEach(function(cb){ d.robots[cb.getAttribute('data-robots')]=cb.checked; }); }
+		S.editDraft=d;
+	}
 
 	function rowHtml(item){
 		var r=item.row, sel=!!S.selected[r.id];
@@ -2864,15 +3348,23 @@ function pgscl_get_app_js() {
 				return '<div class="spm-qe-wrap" id="spm-qe-'+r.id+'"><div class="spm-qe-loading">Failed to load. <button class="button" data-cancel="1">Close</button></div></div>';
 			}
 
-			var curTpl=ed.template||'';
+			// Prefer the live draft (captured before this repaint) over fetched
+			// values, so scrolling never discards the user's in-progress edits.
+			var D=S.editDraft||{};
+			var curTpl=(D.tpl!=null)?D.tpl:(ed.template||'');
+			var curSt=(D.status!=null)?D.status:r.status;
 			var tplOpts=B.templates.map(function(t){return '<option value="'+esc(t.value)+'"'+(t.value===curTpl?' selected':'')+'>'+esc(t.label)+'</option>';}).join('');
-			var stOpts=B.statuses.map(function(s){return '<option value="'+s+'"'+(s===r.status?' selected':'')+'>'+s+'</option>';}).join('');
+			var stOpts=B.statuses.map(function(s){return '<option value="'+s+'"'+(s===curSt?' selected':'')+'>'+s+'</option>';}).join('');
 
 			// One scrollable checkbox box per page taxonomy (hierarchy-indented).
 			function taxBoxHtml(tax){
 				var assigned=(ed.tax&&ed.tax[tax.name])?ed.tax[tax.name]:[];
+				var draftTax=(D.tax&&D.tax[tax.name])?D.tax[tax.name]:null;
 				var rows=tax.terms.map(function(t){
-					var chk=assigned.indexOf(t.value)>-1?' checked':'';
+					var checked=(draftTax&&Object.prototype.hasOwnProperty.call(draftTax,String(t.value)))
+						? !!draftTax[String(t.value)]
+						: assigned.indexOf(t.value)>-1;
+					var chk=checked?' checked':'';
 					var pad=8+(t.depth||0)*16;
 					return '<label class="spm-qe-termchk" style="padding-left:'+pad+'px" title="'+esc(t.path||t.label)+'"><input type="checkbox" data-tax="'+esc(tax.name)+'" data-term="'+t.value+'"'+chk+'> '+esc(t.label)+'</label>';
 				}).join('');
@@ -2890,23 +3382,24 @@ function pgscl_get_app_js() {
 				var robotsAll=s.robots_all||['index','noindex','nofollow','noarchive','noimageindex','nosnippet'];
 				var robotsLabels={index:'Index',noindex:'No Index',nofollow:'No Follow',noarchive:'No Archive',noimageindex:'No Image Index',nosnippet:'No Snippet'};
 				var robotsBoxes=robotsAll.map(function(rk){
-					var chk=(s.robots||[]).indexOf(rk)>-1?' checked':'';
+					var checked=(D.robots)?!!D.robots[rk]:((s.robots||[]).indexOf(rk)>-1);
+					var chk=checked?' checked':'';
 					return '<label class="spm-qe-termchk"><input type="checkbox" data-robots="'+esc(rk)+'"'+chk+'> '+esc(robotsLabels[rk]||rk)+'</label>';
 				}).join('');
 				seoHtml='<div class="spm-qe-seo">'
 					+'<div class="spm-qe-seclabel spm-qe-seohead">SEO Settings <span class="spm-qe-seoplugin">'+esc(B.seoPlugin)+'</span></div>'
 					+'<div class="spm-qe-seo-grid">'
 					+'<div class="spm-qe-seo-col">'
-						+'<div class="spm-qe-field spm-qe-field-stack"><label>SEO Title</label><input class="qe-seo-title" type="text" value="'+esc(s.title||'')+'" placeholder="%title% %sep% %sitename%"></div>'
-						+'<div class="spm-qe-field spm-qe-field-stack"><label>SEO Description</label><textarea class="qe-seo-desc" rows="2" placeholder="%excerpt%">'+esc(s.description||'')+'</textarea></div>'
+						+'<div class="spm-qe-field spm-qe-field-stack"><label>SEO Title</label><input class="qe-seo-title" type="text" value="'+esc(D.seoTitle!=null?D.seoTitle:(s.title||''))+'" placeholder="%title% %sep% %sitename%"></div>'
+						+'<div class="spm-qe-field spm-qe-field-stack"><label>SEO Description</label><textarea class="qe-seo-desc" rows="2" placeholder="%excerpt%">'+esc(D.seoDesc!=null?D.seoDesc:(s.description||''))+'</textarea></div>'
 					+'</div>'
 					+'<div class="spm-qe-seo-col">'
 						+'<div class="spm-qe-seclabel">Robots Meta</div>'
 						+'<div class="spm-qe-taxbox spm-qe-robotsbox">'+robotsBoxes+'</div>'
 					+'</div>'
 					+'<div class="spm-qe-seo-col">'
-						+'<div class="spm-qe-field spm-qe-field-stack"><label>Focus Keyword</label><input class="qe-seo-focus" type="text" value="'+esc(s.focus||'')+'"></div>'
-						+'<div class="spm-qe-field spm-qe-field-stack"><label>Canonical URL</label><input class="qe-seo-canonical" type="text" value="'+esc(s.canonical||'')+'" placeholder="'+esc(r.url||'')+'"></div>'
+						+'<div class="spm-qe-field spm-qe-field-stack"><label>Focus Keyword</label><input class="qe-seo-focus" type="text" value="'+esc(D.seoFocus!=null?D.seoFocus:(s.focus||''))+'"></div>'
+						+'<div class="spm-qe-field spm-qe-field-stack"><label>Canonical URL</label><input class="qe-seo-canonical" type="text" value="'+esc(D.seoCanonical!=null?D.seoCanonical:(s.canonical||''))+'" placeholder="'+esc(r.url||'')+'"></div>'
 					+'</div>'
 					+'</div>'
 				+'</div>';
@@ -2915,10 +3408,10 @@ function pgscl_get_app_js() {
 			return '<div class="spm-qe-wrap" id="spm-qe-'+r.id+'">'
 				+'<div class="spm-qe-grid">'
 				+'<div class="spm-qe-col spm-qe-col-main">'
-					+'<div class="spm-qe-field"><label>Title</label><input class="qe-title" type="text" value="'+esc(r.title)+'" placeholder="Title"></div>'
-					+'<div class="spm-qe-field"><label>Slug</label><input class="qe-slug" type="text" value="'+esc(r.slug)+'" placeholder="Slug"></div>'
+					+'<div class="spm-qe-field"><label>Title</label><input class="qe-title" type="text" value="'+esc(D.title!=null?D.title:r.title)+'" placeholder="Title"></div>'
+					+'<div class="spm-qe-field"><label>Slug</label><input class="qe-slug" type="text" value="'+esc(D.slug!=null?D.slug:r.slug)+'" placeholder="Slug"></div>'
 					+'<div class="spm-qe-field"><label>Status</label><select class="qe-status">'+stOpts+'</select></div>'
-					+'<div class="spm-qe-field"><label>Parent</label><input class="qe-parent-id" type="number" min="0" value="'+esc(r.parent||0)+'" placeholder="Parent ID (0 = top level)"></div>'
+					+'<div class="spm-qe-field"><label>Parent</label><input class="qe-parent-id" type="number" min="0" value="'+esc(D.parent!=null?D.parent:(r.parent||0))+'" placeholder="Parent ID (0 = top level)"></div>'
 					+'<div class="spm-qe-parenthint">'+(r.parentTitle?'Current parent: '+esc(r.parentTitle):'Top level (no parent)')+'</div>'
 					+'<div class="spm-qe-field"><label>Page Tpl</label><select class="qe-tpl">'+tplOpts+'</select></div>'
 				+'</div>'
@@ -2953,7 +3446,7 @@ function pgscl_get_app_js() {
 			+titleInner+'</div>'
 			+'<div class="spm-c spm-c-id" style="'+dupBg+'">#'+r.id+'</div>'
 			+'<div class="spm-c spm-c-slug" style="'+dupBg+'">'+esc('/'+r.slug)+'</div>'
-			+'<div class="spm-c spm-c-parent">'+(r.parentTitle?'<a class="spm-link" href="#" data-filterparent="'+r.parent+'" title="Filter by this parent">'+esc(r.parentTitle)+'</a>':'<span class="spm-muted">—</span>')+'</div>'
+			+ (B.hierarchical ? ('<div class="spm-c spm-c-parent">'+(r.parentTitle?'<a class="spm-link" href="#" data-filterparent="'+r.parent+'" title="Filter by this parent">'+esc(r.parentTitle)+'</a>':'<span class="spm-muted">—</span>')+'</div>') : '')
 			+'<div class="spm-c spm-c-tmpl">'+(r.templateTerms&&r.templateTerms.length
 				? r.templateTerms.map(function(t){return '<span class="spm-tmpl-tag">'+esc(t)+'</span>';}).join('')
 				: '<span class="spm-badge spm-badge-missing">None</span>')+'</div>'
@@ -2981,6 +3474,7 @@ function pgscl_get_app_js() {
 	}
 
 	function paintList(){
+		captureEditDraft(); // preserve in-progress quick-edit values across repaints
 		var spacer=document.getElementById('spm-spacer'); if(!spacer) return;
 		var items=getDisplayItems();
 		var total=items.length;
@@ -3308,11 +3802,27 @@ function pgscl_get_app_js() {
 	/* ───────────────────────────────────────────────
 	 * Shell (rendered once)
 	 * ─────────────────────────────────────────────── */
+	/* Post-type switcher: tabs linking to each managed type's manager screen. */
+	function ptSwitcherHtml(){
+		var types = (B.managedTypes||[]);
+		if(types.length < 2) return '';
+		var tabs = types.map(function(t){
+			var active = (t.postType === B.postType);
+			var mark = t.hierarchical ? 'tree' : 'list';
+			return '<a class="spm-pt-tab'+(active?' active':'')+'" href="'+esc(t.url)+'">'
+				+ esc(t.label)
+				+ ' <span class="spm-pt-kind">'+mark+'</span></a>';
+		}).join('');
+		return '<div class="spm-pt-switch">'+tabs+'</div>';
+	}
+
 	function paintShell(){
 		var fieldOpts=[['auto','Title / ID / URL'],['id','Page ID'],['slug','Slug'],['title','Title']]
 			.map(function(o){return '<option value="'+o[0]+'"'+(S.search.field===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
 		app.innerHTML=
 			'<div id="spm-shell">'
+			// Post-type switcher (only when more than one type is managed)
+			+ ptSwitcherHtml()
 			// Top bar
 			+'<div class="spm-topbar" id="spm-tb">'
 			+' <div class="spm-search">'
@@ -3350,7 +3860,7 @@ function pgscl_get_app_js() {
 			+'  <div class="spm-c spm-c-title" data-sort="title">Title <span id="ar-title"></span></div>'
 			+'  <div class="spm-c spm-c-id" data-sort="id">ID <span id="ar-id"></span></div>'
 			+'  <div class="spm-c spm-c-slug" data-sort="slug">Slug <span id="ar-slug"></span></div>'
-			+'  <div class="spm-c spm-c-parent">Parent</div>'
+			+ (B.hierarchical ? '  <div class="spm-c spm-c-parent">Parent</div>' : '')
 			+'  <div class="spm-c spm-c-tmpl">Template</div>'
 			+'  <div class="spm-c spm-c-elem">Elementor</div>'
 			+'  <div class="spm-c spm-c-status">Status</div>'
@@ -3401,7 +3911,7 @@ function pgscl_get_app_js() {
 		spacerEl.addEventListener('click',function(e){
 			var t=e.target;
 			if(t.hasAttribute('data-save')){ saveQuickEdit(parseInt(t.getAttribute('data-save'),10)); return; }
-			if(t.hasAttribute('data-cancel')){ S.editing=null; S.editData=null; qeMeasured=false; paintList(); return; }
+			if(t.hasAttribute('data-cancel')){ S.editing=null; S.editData=null; S.editDraft=null; qeMeasured=false; paintList(); return; }
 			if(t.hasAttribute('data-sel')){ var sid=parseInt(t.getAttribute('data-sel'),10); if(t.checked) S.selected[sid]=rowById(sid); else delete S.selected[sid]; paintBulk(); return; }
 			if(t.hasAttribute('data-menu')){ e.stopPropagation(); var mid=parseInt(t.getAttribute('data-menu'),10); var rect=t.getBoundingClientRect(); showMenu(rect.right,rect.bottom+4,rowById(mid)); return; }
 			if(t.hasAttribute('data-filterparent')){
@@ -3453,7 +3963,7 @@ function pgscl_get_app_js() {
 			if(!srcId||!targetId||srcId===targetId) return;
 			var trow=rowById(targetId), srow=rowById(srcId); if(!trow||!srow) return;
 			if(!confirm('Make "'+srow.title+'" a child of "'+trow.title+'"?')) return;
-			api('/page/'+srcId,{method:'PATCH',body:JSON.stringify({parent:targetId})}).then(function(){
+			api('/page/'+srcId,{method:'POST',body:JSON.stringify({parent:targetId})}).then(function(){
 				toast('Reparented');
 				var i=S.rows.findIndex(function(x){return x.id===srcId;});
 				if(i>-1){ S.rows[i].parent=targetId; S.rows[i].parentTitle=trow.title; }
@@ -3466,7 +3976,7 @@ function pgscl_get_app_js() {
 			if(['INPUT','SELECT','TEXTAREA'].indexOf(e.target.tagName||'')>-1&&e.key!=='Escape') return;
 			var items=getDisplayItems();
 			if(e.key==='/'){ e.preventDefault(); qi.focus(); return; }
-			if(e.key==='Escape'){ closeMenu(); if(S.editing){S.editing=null;S.editData=null;qeMeasured=false;paintList();} return; }
+			if(e.key==='Escape'){ closeMenu(); if(S.editing){S.editing=null;S.editData=null;S.editDraft=null;qeMeasured=false;paintList();} return; }
 			if(e.key==='j'||e.key==='ArrowDown'){ e.preventDefault(); S.cursorIdx=Math.min(items.length-1,S.cursorIdx+1); ensureVisible(); paintList(); }
 			else if(e.key==='k'||e.key==='ArrowUp'){ e.preventDefault(); S.cursorIdx=Math.max(0,S.cursorIdx-1); ensureVisible(); paintList(); }
 			else if(e.key==='x'){ var it=items[S.cursorIdx]; if(it){ if(S.selected[it.row.id])delete S.selected[it.row.id]; else S.selected[it.row.id]=it.row; paintList(); paintBulk(); } }

@@ -1,6 +1,30 @@
 # Changelog
 All notable changes to this project are documented here. This project adheres to semantic versioning.
 
+## [1.6.0]
+### Added
+- Custom post type support. A Settings > PageScale screen lets you choose which post types PageScale manages.
+- A Scalable Manager screen per managed post type, with a switcher when more than one type is enabled.
+- Automatic tree-vs-flat view: hierarchical types keep the parent/child tree; non-hierarchical types get the flat virtual list.
+### Changed
+- Duplicate now inherits the source item's post type and copies that type's taxonomies.
+- Total and parents caches are keyed per post type.
+- Permission checks validate against each post type's own capabilities.
+### Fixed
+- Duplicating an Elementor page no longer corrupts its layout: copied meta is slashed correctly and per-post builder CSS caches are regenerated for the copy.
+- A duplicated page now gets a unique slug (e.g. privacy-policy-2) while the original keeps its slug unchanged.
+- Quick edit saves are slashed correctly and surface a clear error if a page-builder save hook fails.
+- Permanent deletion from trash verifies the result and recovers when a corrupted builder payload blocks deletion.
+- Quick edit and drag-and-drop reparenting save over POST instead of PATCH; several hosting stacks block PATCH at the server, so saves silently failed.
+- The virtual-scroll repaint no longer resets an open quick-edit form; in-progress values are preserved across repaints.
+- Taxonomy term changes in quick edit now save; the capability check used a non-existent capability name and always failed.
+- The Scalable Manager submenu now attaches correctly under the built-in Posts menu.
+
+## [1.5.1]
+### Security
+- Apply private-page readability filtering to the /parents, /export and /default-view REST endpoints.
+- Cache the parents list per user to avoid serving one user's readable set to another.
+
 ## [1.5.0]
 ### Added
 - Lazy, one-at-a-time FULLTEXT index building to avoid gateway timeouts on large tables.
